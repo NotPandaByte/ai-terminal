@@ -1,0 +1,25 @@
+[package]
+name = "ai-terminal"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ai"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+directories = "5"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+url = "=2.4.1"
+idna = "=0.4.0"
+atty = "0.2"
+futures-util = "0.3"
+whoami = "1"
+nix = { version = "0.27", default-features = false, features = ["user"] }
