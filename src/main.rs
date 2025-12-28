@@ -9,6 +9,7 @@ mod cmd_ai;
 mod cmd_agent;
 mod cmd_model;
 mod cmd_setup;
+mod cmd_status;
 mod tools;
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,8 @@ enum Cmd {
         /// Optional model name (if omitted, you will be prompted)
         name: Option<String>,
     },
+    /// Show current setup (API key, model, local runner status)
+    Status,
 }
 
 // moved to crate::config
@@ -57,6 +60,9 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Model { name }) => {
             cmd_model::run_set_model(name.clone())?;
+        }
+        Some(Cmd::Status) => {
+            cmd_status::show_status().await?;
         }
         None => {
             cmd_ai::run_ai(cli.prompt.clone()).await?;

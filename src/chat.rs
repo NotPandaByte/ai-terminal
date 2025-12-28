@@ -1,181 +1,123 @@
 use anyhow::{anyhow, Context, Result};
-use reqwest;
 use futures_util::StreamExt;
+use reqwest::{self, Client, header::{ACCEPT, CONTENT_TYPE}};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 use crate::config::load_config;
 
-pub async fn call_chat_api(user_prompt: &str, rules_markdown: Option<&str>, is_agent: bool) -> Result<String> {
+// --- Shared Types ---
+#[derive(Serialize)]
+struct Message<'a> { role: &'a str, content: &'a str }
+
+#[derive(Serialize)]
+struct ChatReq<'a> { 
+    model: &'a str, 
+    messages: Vec<Message<'a>>, 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool> 
+}
+
+#[derive(Deserialize)]
+struct ChatResp { choices: Vec<Choice> }
+#[derive(Deserialize)]
+struct Choice { message: AssistantMessage }
+#[derive(Deserialize)]
+struct AssistantMessage { content: String }
+
+/// Helper to prepare common components
+fn prepare_request_data(user_prompt: &str, rules_markdown: Option<&str>, is_agent: bool) -> Result<(String, String, String, String)> {
     let cfg = load_config()?;
-    let api_key = cfg
-        .api_key
-        .clone()
+    
+    // Default to local Ollama if no base is provided, or use config
+    let api_base = cfg.api_base.clone().unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+    let model = cfg.model.clone().unwrap_or_else(|| "llama3".to_string());
+    
+    // API key is now optional for local providers
+    let api_key = cfg.api_key.clone()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .ok_or_else(|| anyhow!("API key not set. Run `ai setup`."))?;
-    let api_base = cfg
-        .api_base
-        .clone()
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let model = cfg
-        .model
-        .clone()
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+        .unwrap_or_else(|| "no-key-required".to_string());
 
-    #[derive(Serialize)]
-    struct Message<'a> { role: &'a str, content: &'a str }
-    #[derive(Serialize)]
-    struct ChatReq<'a> { model: &'a str, messages: Vec<Message<'a>> }
-    #[derive(Deserialize)]
-    struct ChatResp { choices: Vec<Choice> }
-    #[derive(Deserialize)]
-    struct Choice { message: AssistantMessage }
-    #[derive(Deserialize)]
-    struct AssistantMessage { #[allow(dead_code)] role: String, content: String }
-
-    let mut messages: Vec<Message> = Vec::new();
-    let mut system_text = String::new();
-    system_text.push_str("You are a helpful assistant in a terminal.\n");
+    let mut system_text = String::from("You are a helpful assistant in a terminal.\n");
     if is_agent {
         system_text.push_str("Act as an autonomous agent. Provide concise, actionable results.\n");
     }
     if let Some(rules) = rules_markdown {
-        system_text.push_str("\n# Rules (Markdown)\n");
-        system_text.push_str(rules);
+        system_text.push_str(&format!("\n# Rules (Markdown)\n{}", rules));
     }
-    messages.push(Message { role: "system", content: &system_text });
-    messages.push(Message { role: "user", content: user_prompt });
 
-    let body = ChatReq { model: &model, messages };
+    Ok((api_base, api_key, model, system_text))
+}
+
+pub async fn call_chat_api(user_prompt: &str, rules_markdown: Option<&str>, is_agent: bool) -> Result<String> {
+    let (api_base, api_key, model, system_prompt) = prepare_request_data(user_prompt, rules_markdown, is_agent)?;
+    
+    let messages = vec![
+        Message { role: "system", content: &system_prompt },
+        Message { role: "user", content: user_prompt },
+    ];
+
+    let body = ChatReq { model: &model, messages, stream: None };
     let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let resp = client
+
+    let resp = Client::new()
         .post(url)
         .bearer_auth(api_key)
         .json(&body)
         .send()
         .await
-        .context("requesting chat completion")?;
+        .context("Requesting chat completion")?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("API error: {} - {}", status, text));
+        return Err(anyhow!("API error: {} - {}", resp.status(), resp.text().await?));
     }
 
-    let parsed: ChatResp = resp.json().await.context("parsing chat response")?;
-    let content = parsed
-        .choices
-        .get(0)
-        .map(|c| c.message.content.clone())
-        .unwrap_or_else(|| "<no content>".to_string());
-    Ok(content)
+    let parsed: ChatResp = resp.json().await?;
+    Ok(parsed.choices.get(0).map(|c| c.message.content.clone()).unwrap_or_default())
 }
 
 pub async fn stream_chat_api(user_prompt: &str, rules_markdown: Option<&str>, is_agent: bool) -> Result<()> {
-    let cfg = load_config()?;
-    let api_key = cfg
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .ok_or_else(|| anyhow!("API key not set. Run `ai setup`."))?;
-    let api_base = cfg
-        .api_base
-        .clone()
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let model = cfg
-        .model
-        .clone()
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let (api_base, api_key, model, system_prompt) = prepare_request_data(user_prompt, rules_markdown, is_agent)?;
 
-    #[derive(Serialize)]
-    struct Message<'a> { role: &'a str, content: &'a str }
-    #[derive(Serialize)]
-    struct ChatReq<'a> { model: &'a str, messages: Vec<Message<'a>>, stream: bool }
+    let messages = vec![
+        Message { role: "system", content: &system_prompt },
+        Message { role: "user", content: user_prompt },
+    ];
 
-    let mut messages: Vec<Message> = Vec::new();
-    let mut system_text = String::new();
-    system_text.push_str("You are a helpful assistant in a terminal.\n");
-    if is_agent {
-        system_text.push_str("Act as an autonomous agent. Provide concise, actionable results.\n");
-    }
-    if let Some(rules) = rules_markdown {
-        system_text.push_str("\n# Rules (Markdown)\n");
-        system_text.push_str(rules);
-    }
-    messages.push(Message { role: "system", content: &system_text });
-    messages.push(Message { role: "user", content: user_prompt });
-
-    let body = ChatReq { model: &model, messages, stream: true };
+    let body = ChatReq { model: &model, messages, stream: Some(true) };
     let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let resp = client
+
+    let resp = Client::new()
         .post(url)
         .bearer_auth(api_key)
-        .header(reqwest::header::ACCEPT, "text/event-stream")
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "text/event-stream")
+        .header(CONTENT_TYPE, "application/json")
         .json(&body)
         .send()
         .await
-        .context("requesting chat completion (stream)")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("API error: {} - {}", status, text));
-    }
+        .context("Requesting stream")?;
 
     let mut stream = resp.bytes_stream();
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let mut buffer = Vec::new();
+    let mut stdout = std::io::stdout().lock();
+
     while let Some(chunk) = stream.next().await {
         let bytes = chunk?;
-        buffer.extend_from_slice(&bytes);
-        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-            let line = buffer.drain(..=pos).collect::<Vec<u8>>();
-            // trim trailing newline/carriage return
-            let line = line
-                .into_iter()
-                .filter(|b| *b != b'\n' && *b != b'\r')
-                .collect::<Vec<u8>>();
-            if line.starts_with(b"data:") {
-                let data = &line[5..];
-                let data = trim_ascii(data);
-                if data == b"[DONE]" { continue; }
-                if data.is_empty() { continue; }
-                if let Ok(text) = std::str::from_utf8(data) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-                        if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
-                            for choice in choices {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                        write!(handle, "{}", content)?;
-                                        handle.flush()?;
-                                    }
-                                    if let Some(reasons) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                                        if reasons == "stop" {
-                                            // completion ended
-                                        }
-                                    }
-                                }
-                            }
-                        }
+        let text = String::from_utf8_lossy(&bytes);
+        
+        for line in text.lines() {
+            if line.starts_with("data: ") {
+                let data = &line[6..];
+                if data == "[DONE]" { break; }
+                
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(content) = val["choices"][0]["delta"]["content"].as_str() {
+                        write!(stdout, "{}", content)?;
+                        stdout.flush()?;
                     }
                 }
             }
         }
     }
-    writeln!(handle)?;
+    writeln!(stdout)?;
     Ok(())
 }
-
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = s.len();
-    while start < end && s[start].is_ascii_whitespace() { start += 1; }
-    while end > start && s[end - 1].is_ascii_whitespace() { end -= 1; }
-    &s[start..end]
-}
-
-
